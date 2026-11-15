@@ -1,0 +1,26 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "Barye: physical simulation from many cooperating local solvers"
+type: software
+abstract: >-
+  Barye splits a physical simulation into many small patches. Each patch is
+  advanced by its own local solver, classical or learned, and patches
+  cooperate only by exchanging values at their borders. It runs on ordinary
+  CPU cores without a GPU and builds on the crates of Dyne, which runs the
+  same scheme on microcontrollers, so the same patch solvers can run on both.
+  Results are checked bit for bit against the single-patch solution.
+authors:
+  - family-names: "Koyabu"
+    given-names: "Natsuhi"
+repository-code: "https://github.com/physical-edge-native/barye"
+# No version or release date until the first release (they are added then, together with the DOI).
+# Barye is dual licensed: MIT OR Apache-2.0, at your option (see LICENSE-MIT and LICENSE-APACHE).
+# Zenodo's GitHub integration accepts only a single SPDX identifier here (a list makes the
+# metadata import fail), so the Apache-2.0 half is declared. The MIT option still applies.
+license: "Apache-2.0"
+keywords:
+  - numerical simulation
+  - domain decomposition
+  - partial differential equations
+  - WebAssembly
+  - physics-informed neural networks

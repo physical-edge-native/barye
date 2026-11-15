@@ -1,0 +1,10 @@
+# Rust build output (any target/ directory, including crates built separately for wasm32)
+target/
+
+# WebAssembly binaries are build products; they are not committed
+*.wasm
+
+# Local Python environment
+.venv/
+
+# Cargo.lock is committed (reproducible builds of the tools and tests).

@@ -1,0 +1,12 @@
+[package]
+name = "barye-core"
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/physical-edge-native/barye"
+description = "Core of Barye: physical simulation from many cooperating local solvers (builds on Dyne's crates)"
+publish = false
+
+[dependencies]
+dyne-core = { workspace = true }
+dyne-wire = { workspace = true }
