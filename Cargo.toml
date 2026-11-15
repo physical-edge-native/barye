@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = ["crates/barye-core"]
+
+# Dyne's crates are shared rather than copied: the border-exchange format (wire format v2),
+# the WebAssembly solver interface and the deterministic simulator parts.
+# Pinned to one Dyne commit; moving the pin is a change of its own (an issue and a pull request),
+# and every check in scripts/ci-check.sh must still pass bit for bit afterwards.
+[workspace.dependencies]
+dyne-core = { git = "https://github.com/physical-edge-native/dyne", rev = "12d92ee4ae72f72a6962d3bc84666f9f4444899d" }
+dyne-wire = { git = "https://github.com/physical-edge-native/dyne", rev = "12d92ee4ae72f72a6962d3bc84666f9f4444899d" }
