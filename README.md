@@ -2,7 +2,7 @@
 
 **Physical simulation without GPUs, built from many cooperating local solvers.**
 
-The name comes from the barye, the CGS unit of pressure (1 barye = 1 dyne/cm²) — a sibling of
+The name (pronounced /ˈbæri/, "BAR-ee") comes from the barye, the CGS unit of pressure (1 barye = 1 dyne/cm²) — a sibling of
 [Dyne](https://github.com/physical-edge-native/dyne), named after the CGS unit of force.
 
 Part of the [Physical-Edge Native Architecture](https://github.com/physical-edge-native) project.
@@ -44,4 +44,15 @@ equation (which has closed-form treatments):
 
 ## License
 
-TODO: license not yet chosen.
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or https://www.apache.org/licenses/LICENSE-2.0)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or https://opensource.org/licenses/MIT)
+
+at your option.
+
+### Contribution
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
+dual licensed as above, without any additional terms or conditions.
