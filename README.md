@@ -101,6 +101,26 @@ cargo run --release --bin barye-wave3d -- scaling --mode strong --grid 192x192x1
 cargo run --release --bin barye-wave3d -- scaling --mode weak --patch 64x64x64 --cores 1,2,4,8
 ```
 
+## Wider borders: one exchange every k steps
+
+With `--halo k`, each patch keeps `k` layers of its neighbours' values and exchanges them only once
+every `k` steps, advancing the overlapping layers itself in between (the correct part shrinks by one
+layer per step). Because the stencil's reach grows diagonally, patches then also exchange with the
+patches that touch them only at an edge or a corner. Every point still performs the same operations,
+so the result equals the single-patch result bit for bit for every `k`; a `k` larger than a patch
+along a split axis is rejected. `k = 1` (the default) is the one-layer, every-step exchange of Dyne's
+WebAssembly solver, message for message. Details are in [`halo.rs`](crates/barye-core/src/halo.rs).
+
+```sh
+cargo run --release --bin barye-wave2d -- check --grid 41x41 --splits 2x2,4x4,3x5 --halo 1,2,3,4
+cargo run --release --bin barye-wave3d -- scaling --mode strong --grid 192x192x192 --cores 1,2,4,8 --halo 4
+```
+
+Wider borders cut the number of exchanges by a factor of `k`; they do not reduce the memory traffic
+of a step (the overlap is even computed twice). In first measurements on a laptop with cores of
+different speeds (preliminary, on battery), `k = 2` and `k = 4` gave no measurable speed-up in 2D and
+were slower in 3D.
+
 ## Accuracy: convergence order against analytic solutions
 
 Bit-exactness shows that splitting does not change the result, not that the result is accurate.
@@ -121,8 +141,9 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for how to propose changes.
 
 - Parallel runtime beyond one PC (MPI, WebAssembly on PCs)? The first milestone uses Rust
   threads on one PC.
-- How to keep scaling when the update is limited by memory bandwidth (e.g. several steps per
-  border exchange with wider borders)?
+- How to keep scaling when the update is limited by memory bandwidth? Wider borders (above) cut
+  the waiting between patches; computing several steps per cache-sized tile (temporal blocking)
+  is not implemented.
 - A 3D interface for WebAssembly solvers shared with Dyne (the native 3D solver exists).
 
 ## License

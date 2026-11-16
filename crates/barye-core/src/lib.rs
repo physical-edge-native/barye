@@ -16,6 +16,8 @@
 //!   exchanging only border messages with neighbouring patches);
 //! - [`wave2d`]: a native 2D wave-equation patch solver that gives the same bits as Dyne's
 //!   WebAssembly wave solver;
+//! - [`halo`]: wider borders for the native solvers (`k` layers, one exchange every `k` steps,
+//!   bit-identical results);
 //! - [`wasm2d`]: running Dyne's 2D WebAssembly patch solvers as patches;
 //! - [`wave3d`]: a native 3D wave-equation patch solver (seven-point Laplacian) with a documented,
 //!   fixed order of floating-point operations;
@@ -23,6 +25,7 @@
 
 pub mod convergence;
 pub mod decomp;
+pub mod halo;
 pub mod patch;
 pub mod wasm2d;
 pub mod wave2d;

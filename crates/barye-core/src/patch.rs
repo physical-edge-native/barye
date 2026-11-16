@@ -14,7 +14,7 @@
 use crate::decomp::{Block, Decomposition};
 use dyne_wire as wire;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Barrier, Mutex};
 use std::time::{Duration, Instant};
@@ -36,6 +36,11 @@ impl std::error::Error for PatchError {}
 /// One step of a decomposed run is, for every patch: [`outbox`](Self::outbox) (send the current
 /// border values), [`inbox`](Self::inbox) for every message from the neighbours with the same step
 /// number, then [`step`](Self::step).
+///
+/// A solver with a border width `k` = [`halo_width`](Self::halo_width) greater than 1 keeps `k`
+/// layers of its neighbours' values: the exchange (outbox, then inbox) happens only before steps
+/// that are multiples of `k`, and then also with the blocks that touch it at an edge or a corner
+/// ([`Block::diagonals`]), whose link ids it uses as sender ids.
 pub trait PatchSolver: Send {
     /// Appends this patch's border messages for the current step to `out`: one framed message
     /// (`[u32 length][message]`, no end marker) per face that touches a neighbour.
@@ -50,6 +55,14 @@ pub trait PatchSolver: Send {
 
     /// The current values of the block, row-major over the block (axis 0 fastest).
     fn field(&mut self) -> Result<Vec<f64>, PatchError>;
+
+    /// Number of layers of border values exchanged per message (the border width `k`): border
+    /// values are exchanged once every `k` steps, and with diagonal neighbours if `k > 1`. All
+    /// patches of a run must use the same width. The default is 1 (one layer, every step, face
+    /// neighbours only), the scheme of Dyne's WebAssembly solvers.
+    fn halo_width(&self) -> usize {
+        1
+    }
 }
 
 /// Advances one patch that has no neighbours (the single-patch reference) for `steps` steps on
@@ -115,6 +128,11 @@ where
 /// so messages for the next step that arrive early are kept until that step. The result does not
 /// depend on the timing of the threads.
 ///
+/// With solvers whose [`PatchSolver::halo_width`] is `k > 1`, borders are exchanged only before
+/// steps that are multiples of `k`, also with diagonal neighbours, and a worker may run at most one
+/// exchange (`k` steps) ahead of a neighbour. All solvers must report the same width; a mismatch is
+/// an error.
+///
 /// If any worker fails, the others stop and the first error is returned.
 pub fn run_threaded_with<const D: usize, S, F>(
     decomp: &Decomposition<D>,
@@ -132,6 +150,8 @@ where
     let start = Barrier::new(n + 1);
     let end = Barrier::new(n + 1);
     let error: Mutex<Option<PatchError>> = Mutex::new(None);
+    // Border width of each block's solver (0 until built, or if building failed).
+    let widths: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(0)).collect();
 
     let fail = |e: PatchError| {
         abort.store(true, Ordering::SeqCst);
@@ -146,11 +166,16 @@ where
         let mut handles = Vec::with_capacity(n);
         for (b, rx) in decomp.blocks.iter().zip(receivers) {
             // Senders to this block's neighbours: (interface id, channel of the neighbour).
-            let to: Vec<(u32, mpsc::Sender<Vec<u8>>)> =
+            let mut to: Vec<(u32, mpsc::Sender<Vec<u8>>)> =
                 b.faces.iter().flatten().map(|i| (i.id, senders[i.neighbour].clone())).collect();
-            let (make, abort, start, end, fail) = (&make, &abort, &start, &end, &fail);
+            // Senders to the diagonal neighbours, used only if the solver's border width is above 1.
+            let to_diagonal: Vec<(u32, mpsc::Sender<Vec<u8>>)> =
+                b.diagonals.iter().map(|d| (d.id, senders[d.neighbour].clone())).collect();
+            let (make, abort, start, end, fail, widths) = (&make, &abort, &start, &end, &fail, &widths);
             handles.push(scope.spawn(move || -> Option<(Vec<f64>, Duration)> {
                 let solver = make(b);
+                let width = solver.as_ref().map_or(0, |s| s.halo_width());
+                widths[b.index].store(width, Ordering::SeqCst);
                 start.wait();
                 let mut solver = match solver {
                     Ok(s) => s,
@@ -160,8 +185,28 @@ where
                         return None;
                     }
                 };
-                let mut w = Worker { need: b.interface_count(), to, rx, abort, spin: options.spin };
-                let result = w.run(&mut solver, steps);
+                // Every built neighbour must use the same border width.
+                let mismatch = b
+                    .faces
+                    .iter()
+                    .flatten()
+                    .map(|i| i.neighbour)
+                    .chain(b.diagonals.iter().map(|d| d.neighbour))
+                    .map(|nb| (nb, widths[nb].load(Ordering::SeqCst)))
+                    .find(|&(_, w)| w != 0 && w != width);
+                let result = if width == 0 {
+                    Err(PatchError("border width (halo) must be at least 1".into()))
+                } else if let Some((nb, w)) = mismatch {
+                    Err(PatchError(format!(
+                        "border width (halo) {width} differs from the width {w} of neighbouring block {nb};                          all patches must use the same width"
+                    )))
+                } else {
+                    if width > 1 {
+                        to.extend(to_diagonal);
+                    }
+                    let mut w = Worker { need: to.len(), to, rx, abort, spin: options.spin, every: width as u64 };
+                    w.run(&mut solver, steps)
+                };
                 if result.is_err() {
                     // Make the neighbours stop waiting before this worker waits at the end.
                     abort.store(true, Ordering::SeqCst);
@@ -200,6 +245,8 @@ struct Worker<'a> {
     rx: mpsc::Receiver<Vec<u8>>,
     abort: &'a AtomicBool,
     spin: Duration,
+    /// Border width: exchange before every `every`-th step.
+    every: u64,
 }
 
 impl Worker<'_> {
@@ -238,7 +285,7 @@ impl Worker<'_> {
         let mut compute = Duration::ZERO;
         for s in 0..steps {
             self.stopped()?;
-            if self.need > 0 {
+            if self.need > 0 && s % self.every == 0 {
                 // Send this step's border values, each message to the neighbour across its interface.
                 out.clear();
                 solver.outbox(&mut out)?;
@@ -274,7 +321,7 @@ impl Worker<'_> {
                             solver.inbox(&msg)?;
                             got += 1;
                         }
-                        ms if ms == s + 1 => early.push(msg),
+                        ms if ms == s + self.every => early.push(msg),
                         ms => return Err(PatchError(format!("message for step {ms} while at step {s}"))),
                     }
                 }

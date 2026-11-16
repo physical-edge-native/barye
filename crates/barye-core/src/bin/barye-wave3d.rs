@@ -2,10 +2,10 @@
 //!
 //! ```text
 //! barye-wave3d check   [--grid 25x23x21] [--steps 100] [--splits 1x1x1,2x2x2,3x2x1,4x4x2]
-//!                      [--initial gauss|sin|cos] [--outer fixed|zero-gradient|absorbing]
+//!                      [--initial gauss|sin|cos] [--outer fixed|zero-gradient|absorbing] [--halo 1,2,...]
 //! barye-wave3d scaling --mode strong [--grid 256x256x256] [--cores 1,2,4,8] [--steps 20] [--repeat 3]
 //! barye-wave3d scaling --mode weak   [--patch 64x64x64]   [--cores 1,2,4,8] [--steps 20] [--repeat 3]
-//!                      [--spin-us N] [--no-verify]
+//!                      [--halo K] [--spin-us N] [--no-verify]
 //! barye-wave3d convergence
 //! ```
 //!
@@ -20,6 +20,11 @@
 //! the single-patch solve of the same grid (unless `--no-verify`). The problem is a standing wave
 //! (`sin(πx)·sin(πy)·sin(πz)`, fixed value 0, Courant number 0.5), chosen so that no subnormal
 //! numbers appear (they are slow on most CPUs and would distort the timing).
+//!
+//! `--halo K` sets the border width: `K` layers of the neighbours' values (faces, edges and corners),
+//! exchanged once every `K` steps (default 1: one layer of face values every step;
+//! `barye_core::halo`). `check` accepts a list and checks every split with every width; a width
+//! larger than a patch along a split axis is an error.
 //!
 //! `convergence` runs the convergence-order check of the solver against an analytic standing wave
 //! (`barye_core::convergence`): it prints the error table and the observed orders, then
@@ -36,9 +41,9 @@ use std::time::{Duration, Instant};
 fn usage() -> ! {
     eprintln!(
         "usage:\n  barye-wave3d check [--grid NXxNYxNZ] [--steps N] [--splits PXxPYxPZ,...] [--initial gauss|sin|cos] \
-         [--outer fixed|zero-gradient|absorbing]\n  \
+         [--outer fixed|zero-gradient|absorbing] [--halo K,...]\n  \
          barye-wave3d scaling --mode strong|weak [--grid NXxNYxNZ] [--patch NXxNYxNZ] [--cores 1,2,...] [--steps N] \
-         [--repeat N] [--spin-us N] [--no-verify]\n  \
+         [--repeat N] [--halo K] [--spin-us N] [--no-verify]\n  \
          barye-wave3d convergence"
     );
     std::process::exit(2)
@@ -101,6 +106,8 @@ fn check(a: &HashMap<String, String>) -> Result<bool, PatchError> {
     };
     let splits: Vec<[usize; 3]> =
         a.get("splits").map_or("1x1x1,2x2x2,3x2x1,4x4x2", |s| s).split(',').map(triple).collect();
+    let halos: Vec<usize> =
+        a.get("halo").map_or("1", |s| s).split(',').map(|t| t.parse().unwrap_or_else(|_| usage())).collect();
     let p = problem(points, initial, outer);
     println!(
         "barye-wave3d check: grid {}x{}x{}, {steps} steps, Courant number {}, native solver",
@@ -112,20 +119,22 @@ fn check(a: &HashMap<String, String>) -> Result<bool, PatchError> {
     let reference = single(&p, steps)?;
     println!("single patch         crc32 {:08x}", field_crc32(&reference));
     let mut ok = true;
-    for parts in splits {
-        let d = Decomposition::new(points, parts, MIN_POINTS).map_err(|e| PatchError(e.0))?;
-        let r = run_threaded(&d, steps, |b| Wave3dPatch::new(&p, b))?;
-        let pass = same_bits(&reference, &r.field);
-        ok &= pass;
-        println!(
-            "split {:>2}x{:>2}x{:<2} ({:>3} threads) crc32 {:08x}  {}",
-            parts[0],
-            parts[1],
-            parts[2],
-            d.blocks.len(),
-            field_crc32(&r.field),
-            if pass { "PASS (bit-exact)" } else { "FAIL" }
-        );
+    for &halo in &halos {
+        for &parts in &splits {
+            let d = Decomposition::new(points, parts, MIN_POINTS).map_err(|e| PatchError(e.0))?;
+            let r = run_threaded(&d, steps, |b| Wave3dPatch::with_halo(&p, b, halo))?;
+            let pass = same_bits(&reference, &r.field);
+            ok &= pass;
+            println!(
+                "split {:>2}x{:>2}x{:<2} ({:>3} threads) halo {halo} crc32 {:08x}  {}",
+                parts[0],
+                parts[1],
+                parts[2],
+                d.blocks.len(),
+                field_crc32(&r.field),
+                if pass { "PASS (bit-exact)" } else { "FAIL" }
+            );
+        }
     }
     Ok(ok)
 }
@@ -172,6 +181,7 @@ fn scaling(a: &HashMap<String, String>) -> Result<bool, PatchError> {
     let verify = !a.contains_key("no-verify");
     let spin_us: u64 = a.get("spin-us").map_or(Ok(0), |s| s.parse()).unwrap_or_else(|_| usage());
     let options = RunOptions { spin: Duration::from_micros(spin_us) };
+    let halo: usize = a.get("halo").map_or(Ok(1), |s| s.parse()).unwrap_or_else(|_| usage());
     let grid = triple(a.get("grid").map_or("256x256x256", |s| s));
     let patch = triple(a.get("patch").map_or("64x64x64", |s| s));
     let initial = Initial::SinMode { m: 1.0, n: 1.0, l: 1.0, amp: 1.0 };
@@ -179,12 +189,12 @@ fn scaling(a: &HashMap<String, String>) -> Result<bool, PatchError> {
 
     if strong {
         println!(
-            "strong scaling: grid {}x{}x{}, {steps} steps, median of {repeat}, native solver, spin {spin_us} us, {logical} logical CPUs",
+            "strong scaling: grid {}x{}x{}, {steps} steps, median of {repeat}, native solver, halo {halo}, spin {spin_us} us, {logical} logical CPUs",
             grid[0], grid[1], grid[2]
         );
     } else {
         println!(
-            "weak scaling: {}x{}x{} points per patch, {steps} steps, median of {repeat}, native solver, spin {spin_us} us, {logical} logical CPUs",
+            "weak scaling: {}x{}x{} points per patch, {steps} steps, median of {repeat}, native solver, halo {halo}, spin {spin_us} us, {logical} logical CPUs",
             patch[0], patch[1], patch[2]
         );
     }
@@ -212,7 +222,7 @@ fn scaling(a: &HashMap<String, String>) -> Result<bool, PatchError> {
         let d = Decomposition::new(points, parts, MIN_POINTS).map_err(|e| PatchError(e.0))?;
         let mut runs = Vec::with_capacity(repeat);
         for _ in 0..repeat {
-            let r = run_threaded_with(&d, steps, options, |b| Wave3dPatch::new(&p, b))?;
+            let r = run_threaded_with(&d, steps, options, |b| Wave3dPatch::with_halo(&p, b, halo))?;
             runs.push((r.wall.as_secs_f64() / steps as f64, r));
         }
         runs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
