@@ -19,6 +19,10 @@
 #   5. convergence order of the 2D and 3D wave solvers against analytic standing waves (fixed
 #      Courant number 0.5, errors at t = 0.5 on refined grids): every observed order must lie in
 #      [1.9, 2.1] (band and reasons in crates/barye-core/src/convergence.rs)
+#   6. wider borders (k layers exchanged once every k steps, also with edge and corner neighbours):
+#      2D 41x41 and 3D 25x23x21, even and uneven splits, k = 1, 2, 3, 4, with fixed, zero-gradient
+#      and absorbing outer faces: every run must print "PASS (bit-exact)" with the single-patch
+#      hash; a width larger than a patch must be rejected with an error naming the halo width
 #
 # Usage (from the repository root):  bash scripts/ci-check.sh
 set -euo pipefail
@@ -84,6 +88,37 @@ for dim in 2d 3d; do
     echo "wave$dim order    FAIL"; fail=1
   fi
 done
+
+echo "== [6] wider borders: k layers every k steps = single patch (bit-exact) =="
+for outer in fixed zero-gradient absorbing; do
+  out=$(cargo run --release --locked --quiet --bin barye-wave2d -- check --grid 41x41 --steps 101 \
+          --splits 2x2,4x4,8x8,3x5 --halo 1,2,3,4 --outer "$outer") || true
+  passes=$(printf '%s\n' "$out" | grep -c "PASS (bit-exact)" || true)
+  printf '%s\n' "$out" | sed -n 2p
+  if [ "$passes" -eq 16 ]; then
+    echo "wave2d halo $outer: 16 of 16 bit-exact  OK"
+  else
+    echo "$out"; echo "wave2d halo $outer  FAIL"; fail=1
+  fi
+  out=$(cargo run --release --locked --quiet --bin barye-wave3d -- check --grid 25x23x21 --steps 41 \
+          --splits 2x2x2,3x2x1,4x4x2,1x3x5 --halo 1,2,3,4 --outer "$outer") || true
+  passes=$(printf '%s\n' "$out" | grep -c "PASS (bit-exact)" || true)
+  printf '%s\n' "$out" | sed -n 2p
+  if [ "$passes" -eq 16 ]; then
+    echo "wave3d halo $outer: 16 of 16 bit-exact  OK"
+  else
+    echo "$out"; echo "wave3d halo $outer  FAIL"; fail=1
+  fi
+done
+# 8x8 patches of a 41x41 grid have 5 or 6 points per axis: a width of 6 must be refused.
+if out=$(cargo run --release --locked --quiet --bin barye-wave2d -- check --grid 41x41 --steps 10 \
+           --splits 8x8 --halo 6 2>&1); then
+  echo "$out"; echo "halo too wide    FAIL (accepted)"; fail=1
+elif printf '%s\n' "$out" | grep -q "halo width 6 is larger than the patch"; then
+  echo "halo too wide    OK (rejected)"
+else
+  echo "$out"; echo "halo too wide    FAIL (wrong error)"; fail=1
+fi
 
 if [ "$fail" -ne 0 ]; then echo "CI CHECK FAILED"; exit 1; fi
 echo "ALL CHECKS PASSED"

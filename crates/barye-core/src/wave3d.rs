@@ -56,8 +56,8 @@
 //! two in-face axes runs fastest (face x: y fastest, then z; face y: x, then z; face z: x, then y).
 
 use crate::decomp::Block;
+use crate::halo::Window;
 use crate::patch::{PatchError, PatchSolver};
-use dyne_wire as wire;
 
 pub use crate::wave2d::Outer;
 
@@ -122,35 +122,29 @@ impl Wave3dProblem {
     }
 }
 
-/// What one face of a patch is.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Face {
-    Interface(u32),
-    Fixed(f64),
-    ZeroGradient,
-    Absorbing,
-}
-
 /// The native 3D wave solver for one patch.
 pub struct Wave3dPatch {
-    n: [usize; 3],
     nu2: f64,
     half_nu2: f64,
     kmur: f64,
-    face: [Face; 6],
-    /// Current level `u^n` with one layer of ghost points: `(nx+2)·(ny+2)·(nz+2)` values, x fastest.
+    /// Layout, faces, neighbours and exchange schedule.
+    win: Window<3>,
+    /// Current level `u^n` with the overlap layers and one layer of ghost points, x fastest.
     u: Vec<f64>,
     /// Previous level `u^{n−1}` (overwritten point by point with `u^{n+1}` during a step).
     p: Vec<f64>,
-    got: [bool; 6],
-    step: u64,
-    /// Scratch space for the values of one face as little-endian bytes.
-    edge: Vec<u8>,
 }
 
 impl Wave3dPatch {
-    /// Sets up the solver of block `b` of `problem` at step 0.
+    /// Sets up the solver of block `b` of `problem` at step 0, exchanging one layer every step.
     pub fn new(problem: &Wave3dProblem, b: &Block<3>) -> Result<Self, PatchError> {
+        Self::with_halo(problem, b, 1)
+    }
+
+    /// Sets up the solver of block `b` of `problem` at step 0, exchanging `halo` layers once every
+    /// `halo` steps. Fails if the block has fewer than `halo` points along an axis on which it has a
+    /// neighbour.
+    pub fn with_halo(problem: &Wave3dProblem, b: &Block<3>, halo: usize) -> Result<Self, PatchError> {
         let n = b.size;
         if n.iter().any(|&k| k < MIN_POINTS) {
             return Err(PatchError(format!(
@@ -168,147 +162,51 @@ impl Wave3dPatch {
         }
         let nu = problem.c * problem.dt / problem.h;
         let nu2 = nu * nu;
-        let mut face = [Face::ZeroGradient; 6];
-        for (f, slot) in face.iter_mut().enumerate() {
-            *slot = match (b.faces[f], problem.outer[f]) {
-                (Some(i), _) => Face::Interface(i.id),
-                (None, Outer::Fixed(v)) => Face::Fixed(v),
-                (None, Outer::ZeroGradient) => Face::ZeroGradient,
-                (None, Outer::Absorbing) => Face::Absorbing,
-            };
-        }
-        let total = (n[0] + 2) * (n[1] + 2) * (n[2] + 2);
-        let largest_face = (n[0] * n[1]).max(n[0] * n[2]).max(n[1] * n[2]);
+        let win = Window::new(b, &problem.outer, halo)?;
+        let total = win.total();
         let mut s = Wave3dPatch {
-            n,
             nu2,
             half_nu2: 0.5 * nu2,
             kmur: (nu - 1.0) / (nu + 1.0),
-            face,
+            win,
             u: vec![0.0; total],
             p: vec![0.0; total],
-            got: [false; 6],
-            step: 0,
-            edge: Vec::with_capacity(8 * largest_face),
         };
         let [ix0, iy0, iz0] = b.origin;
         for k in 0..n[2] {
             for j in 0..n[1] {
                 for i in 0..n[0] {
-                    let idx = s.at(i as isize, j as isize, k as isize);
+                    let idx = s.win.at([i as isize, j as isize, k as isize]);
                     s.u[idx] = problem.initial_at(ix0 + i, iy0 + j, iz0 + k);
                 }
             }
         }
-        s.apply_fixed();
+        let own = s.win.own();
+        s.win.apply_fixed(&mut s.u, &own);
         Ok(s)
     }
 
     /// Number of steps done.
     pub fn steps_done(&self) -> u64 {
-        self.step
+        self.win.step
     }
 
-    #[inline]
-    fn at(&self, i: isize, j: isize, k: isize) -> usize {
-        let (wx, wy) = (self.n[0] + 2, self.n[1] + 2);
-        (((k + 1) as usize) * wy + (j + 1) as usize) * wx + (i + 1) as usize
+    /// Number of layers exchanged (one exchange every that many steps).
+    pub fn halo(&self) -> usize {
+        self.win.k
     }
 
-    /// Sizes of the slab of face `f`: (fast in-face axis, slow in-face axis).
-    fn face_dims(&self, f: usize) -> (usize, usize) {
-        match f / 2 {
-            0 => (self.n[1], self.n[2]),
-            1 => (self.n[0], self.n[2]),
-            _ => (self.n[0], self.n[1]),
-        }
-    }
-
-    fn face_len(&self, f: usize) -> usize {
-        let (a, b) = self.face_dims(f);
-        a * b
-    }
-
-    /// Point `(a, b)` of the slab of face `f` (`a` along the fast in-face axis), at `depth` points
-    /// inward from the face (−1 = ghost, 0 = face point, 1 = first interior point).
-    fn face_point(&self, f: usize, a: usize, b: usize, depth: isize) -> usize {
-        let (a, b) = (a as isize, b as isize);
-        let along = |axis: usize| -> isize {
-            if f % 2 == 0 {
-                depth
-            } else {
-                self.n[axis] as isize - 1 - depth
-            }
-        };
-        match f / 2 {
-            0 => self.at(along(0), a, b),
-            1 => self.at(a, along(1), b),
-            _ => self.at(a, b, along(2)),
-        }
-    }
-
-    /// Calls `g(a, b)` for every point of the slab of face `f`, in slab order.
-    fn for_slab(&self, f: usize, mut g: impl FnMut(usize, usize)) {
-        let (na, nb) = self.face_dims(f);
-        for b in 0..nb {
-            for a in 0..na {
-                g(a, b);
-            }
-        }
-    }
-
-    fn apply_fixed(&mut self) {
-        for f in 0..6 {
-            if let Face::Fixed(v) = self.face[f] {
-                let (na, nb) = self.face_dims(f);
-                for b in 0..nb {
-                    for a in 0..na {
-                        let idx = self.face_point(f, a, b, 0);
-                        self.u[idx] = v;
-                    }
-                }
-            }
-        }
-    }
-
-    /// Fills the ghost points of the outer faces from the current level (the ghost points of the
-    /// interfaces were filled by [`PatchSolver::inbox`]).
-    fn fill_outer_ghosts(&mut self) {
-        for f in 0..6 {
-            let (na, nb) = self.face_dims(f);
-            match self.face[f] {
-                Face::Interface(_) => {}
-                Face::ZeroGradient | Face::Absorbing => {
-                    for b in 0..nb {
-                        for a in 0..na {
-                            let (g, m) = (self.face_point(f, a, b, -1), self.face_point(f, a, b, 1));
-                            self.u[g] = self.u[m];
-                        }
-                    }
-                }
-                Face::Fixed(v) => {
-                    for b in 0..nb {
-                        for a in 0..na {
-                            let g = self.face_point(f, a, b, -1);
-                            self.u[g] = v;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Update of all points (rows along x are independent; every point uses the operations of the
-    /// module documentation, in that order).
-    fn update_interior(&mut self) {
-        let [nx, ny, nz] = self.n;
-        let w = nx + 2;
-        let plane = w * (ny + 2);
+    /// Update of the points of `region` (rows along x are independent; every point uses the
+    /// operations of the module documentation, in that order).
+    fn update(&mut self, region: &crate::halo::Range<3>) {
+        let [(x0, x1), (y0, y1), (z0, z1)] = *region;
+        let nx = (x1 - x0) as usize;
+        let (w, plane) = (self.win.stride(1), self.win.stride(2));
         let (nu2, half_nu2) = (self.nu2, self.half_nu2);
-        let first = self.step == 0;
-        for k in 1..=nz {
-            for j in 1..=ny {
-                let row = k * plane + j * w + 1;
+        let first = self.win.step == 0;
+        for k in z0..z1 {
+            for j in y0..y1 {
+                let row = self.win.at([x0, j, k]);
                 let west = &self.u[row - 1..row - 1 + nx];
                 let mid = &self.u[row..row + nx];
                 let east = &self.u[row + 1..row + 1 + nx];
@@ -335,112 +233,34 @@ impl Wave3dPatch {
             }
         }
     }
-
-    /// Mur's absorbing condition on the points of absorbing faces (new level in `p`).
-    fn apply_absorbing(&mut self) {
-        for f in 0..6 {
-            if self.face[f] != Face::Absorbing {
-                continue;
-            }
-            let (na, nb) = self.face_dims(f);
-            for b in 0..nb {
-                for a in 0..na {
-                    let (e, m) = (self.face_point(f, a, b, 0), self.face_point(f, a, b, 1));
-                    self.p[e] = self.u[m] + self.kmur * (self.p[m] - self.u[e]);
-                }
-            }
-        }
-    }
 }
 
 impl PatchSolver for Wave3dPatch {
     fn outbox(&mut self, out: &mut Vec<u8>) -> Result<(), PatchError> {
-        for f in 0..6 {
-            let Face::Interface(id) = self.face[f] else { continue };
-            let n = self.face_len(f);
-            let mut edge = std::mem::take(&mut self.edge);
-            edge.clear();
-            self.for_slab(f, |a, b| {
-                let v = self.u[self.face_point(f, a, b, 0)];
-                edge.extend_from_slice(&v.to_bits().to_le_bytes());
-            });
-            let hdr = wire::Header {
-                kind: wire::KIND_IFACE_BAND,
-                quantity: wire::QTY_DISPLACEMENT,
-                src: id,
-                step: self.step,
-                t_us: 0,
-            };
-            let payload = wire::Payload::IfaceBand { data: &edge, count: n as u32, per_point: 1 };
-            let start = out.len();
-            out.resize(start + 4 + wire::HDR_LEN + 8 + 8 * n, 0);
-            let mut mb = wire::MailboxWriter::new(&mut out[start..]);
-            let pushed = mb.push(&hdr, &payload);
-            let used = mb.used();
-            self.edge = edge;
-            pushed.map_err(|e| PatchError(format!("cannot encode border message: {e:?}")))?;
-            out.truncate(start + used);
-        }
-        Ok(())
+        self.win.outbox(&self.u, &self.p, out)
     }
 
     fn inbox(&mut self, framed: &[u8]) -> Result<(), PatchError> {
-        for msg in wire::MailboxReader::new(framed) {
-            let (hdr, payload, _) = msg.map_err(|e| PatchError(format!("malformed border message: {e:?}")))?;
-            let wire::Payload::IfaceBand { data, count, per_point } = payload else {
-                return Err(PatchError(format!("unexpected message kind {}", hdr.kind)));
-            };
-            let f = (0..6)
-                .find(|&f| self.face[f] == Face::Interface(hdr.src))
-                .ok_or_else(|| PatchError(format!("message from unknown interface {}", hdr.src)))?;
-            if hdr.step != self.step || count as usize != self.face_len(f) || per_point < 1 {
-                return Err(PatchError(format!(
-                    "border message (interface {}, step {}, {} values) does not fit (step {}, {} values)",
-                    hdr.src,
-                    hdr.step,
-                    count,
-                    self.step,
-                    self.face_len(f)
-                )));
-            }
-            let pp = per_point as usize;
-            let (na, nb) = self.face_dims(f);
-            for b in 0..nb {
-                for a in 0..na {
-                    let g = self.face_point(f, a, b, -1);
-                    self.u[g] = wire::band_get(data, (b * na + a) * pp);
-                }
-            }
-            self.got[f] = true;
-        }
-        Ok(())
+        self.win.inbox(&mut self.u, &mut self.p, framed)
     }
 
     fn step(&mut self) -> Result<(), PatchError> {
-        for f in 0..6 {
-            if matches!(self.face[f], Face::Interface(_)) && !self.got[f] {
-                return Err(PatchError(format!("step {}: border values of face {f} missing", self.step)));
-            }
-        }
-        self.fill_outer_ghosts();
-        self.update_interior();
-        self.apply_absorbing();
+        self.win.check_ready()?;
+        let region = self.win.region();
+        self.win.fill_outer_ghosts(&mut self.u, &region);
+        self.update(&region);
+        self.win.apply_absorbing(&self.u, &mut self.p, self.kmur, &region);
         std::mem::swap(&mut self.u, &mut self.p);
-        self.apply_fixed();
-        self.step += 1;
-        self.got = [false; 6];
+        self.win.apply_fixed(&mut self.u, &region);
+        self.win.advance();
         Ok(())
     }
 
     fn field(&mut self) -> Result<Vec<f64>, PatchError> {
-        let [nx, ny, nz] = self.n;
-        let mut out = Vec::with_capacity(nx * ny * nz);
-        for k in 0..nz {
-            for j in 0..ny {
-                let row = self.at(0, j as isize, k as isize);
-                out.extend_from_slice(&self.u[row..row + nx]);
-            }
-        }
-        Ok(out)
+        Ok(self.win.field(&self.u))
+    }
+
+    fn halo_width(&self) -> usize {
+        self.win.k
     }
 }

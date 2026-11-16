@@ -163,3 +163,60 @@ fn missing_border_values_are_an_error() {
     let mut s = Wave3dPatch::new(&p, &d.blocks[0]).unwrap();
     assert!(s.step().is_err());
 }
+
+/// Splits with wider borders (k layers exchanged once every k steps, with the face, edge and corner
+/// neighbours) match the single-patch solution bit for bit, for every kind of outer boundary and
+/// even and uneven splits; a width larger than a patch along a split axis is rejected.
+#[test]
+fn wide_borders_match_single_patch_bit_for_bit() {
+    let points = [25, 23, 21];
+    let cases = [
+        ("fixed", problem(points, 0.5, GAUSS, FIX0)),
+        ("zero gradient", problem(points, 0.5, GAUSS, ZG)),
+        ("absorbing", problem(points, 0.5, GAUSS, ABS)),
+        ("mixed", problem(points, 0.5, GAUSS, MIXED)),
+        ("unstable", problem(points, 0.6, GAUSS, FIX0)),
+    ];
+    // [1, 1, 7] leaves 3 points per patch along z: rejected for k = 4.
+    let parts = [[2, 2, 2], [3, 2, 1], [4, 4, 2], [1, 3, 5], [5, 1, 2], [1, 1, 7]];
+    for (name, p) in cases {
+        let reference = single(&p, 47);
+        for k in [2, 3, 4] {
+            for pp in parts {
+                let d = Decomposition::new(p.points, pp, MIN_POINTS).unwrap();
+                let too_wide = (0..3).any(|a| pp[a] > 1 && d.blocks.iter().any(|b| b.size[a] < k));
+                let r = run_threaded(&d, 47, |b| Wave3dPatch::with_halo(&p, b, k));
+                let what = format!("{name} {}x{}x{} halo {k}", pp[0], pp[1], pp[2]);
+                if too_wide {
+                    let e = r.err().unwrap_or_else(|| panic!("{what}: should be rejected"));
+                    assert!(e.0.contains(&format!("halo width {k}")), "{what}: {e}");
+                } else {
+                    assert_bits_equal(&reference, &r.unwrap().field, &what);
+                }
+            }
+        }
+    }
+}
+
+/// With k = 2, the low corner block of a 2×2×2 split sends 7 messages at step 0: 3 faces, 3 edges
+/// and 1 corner, each with the current level on k layers and the previous level on k − 1 layers.
+#[test]
+fn wide_border_messages_reach_edges_and_corners() {
+    use barye_core::wire;
+    let p = problem([25, 23, 21], 0.5, GAUSS, FIX0);
+    let d = Decomposition::new(p.points, [2, 2, 2], MIN_POINTS).unwrap();
+    let b = &d.blocks[0];
+    let mut s = Wave3dPatch::with_halo(&p, b, 2).unwrap();
+    let mut out = Vec::new();
+    s.outbox(&mut out).unwrap();
+    let counts: Vec<usize> = wire::MailboxReader::new(&out)
+        .map(|m| match m.unwrap().1 {
+            wire::Payload::IfaceBand { count, .. } => count as usize,
+            _ => panic!("band expected"),
+        })
+        .collect();
+    let [nx, ny, nz] = b.size;
+    // faces x, y, z; then the edges (x,y), (x,z), (y,z) and the corner, in base-3 offset order
+    let expect = vec![3 * ny * nz, 3 * nx * nz, 3 * nx * ny, 5 * nz, 5 * ny, 5 * nx, 8 + 1];
+    assert_eq!(counts, expect);
+}

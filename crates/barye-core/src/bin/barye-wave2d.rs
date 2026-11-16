@@ -3,10 +3,10 @@
 //! ```text
 //! barye-wave2d check   [--grid 41x41] [--steps 400] [--splits 1x1,2x2,4x4,8x8,3x5]
 //!                      [--initial gauss|sin|cos] [--outer fixed|zero-gradient|absorbing]
-//!                      [--wasm PATH]
+//!                      [--halo 1,2,...] [--wasm PATH]
 //! barye-wave2d scaling --mode strong [--grid 2048x2048] [--cores 1,2,4,8] [--steps 100] [--repeat 3]
 //! barye-wave2d scaling --mode weak   [--patch 512x512]  [--cores 1,2,4,8] [--steps 100] [--repeat 3]
-//!                      [--spin-us N] [--wasm PATH] [--no-verify]
+//!                      [--halo K] [--spin-us N] [--wasm PATH] [--no-verify]
 //! barye-wave2d convergence
 //! ```
 //!
@@ -27,6 +27,11 @@
 //!
 //! With `--wasm PATH`, patches run Dyne's WebAssembly wave solver (`wave2d-actor`) in the `wasmi`
 //! interpreter instead of the native solver.
+//!
+//! `--halo K` sets the border width of the native solver: `K` layers of the neighbours' values,
+//! exchanged once every `K` steps (default 1, one layer every step as in Dyne's solver;
+//! `barye_core::halo`). `check` accepts a list and checks every split with every width; a width
+//! larger than a patch along a split axis is an error. Dyne's WebAssembly solver supports only 1.
 
 use barye_core::decomp::{Block, Decomposition};
 use barye_core::field_crc32;
@@ -40,9 +45,9 @@ use std::time::{Duration, Instant};
 fn usage() -> ! {
     eprintln!(
         "usage:\n  barye-wave2d check [--grid NXxNY] [--steps N] [--splits PXxPY,...] [--initial gauss|sin|cos] \
-         [--outer fixed|zero-gradient|absorbing] [--wasm PATH]\n  \
+         [--outer fixed|zero-gradient|absorbing] [--halo K,...] [--wasm PATH]\n  \
          barye-wave2d scaling --mode strong|weak [--grid NXxNY] [--patch NXxNY] [--cores 1,2,...] [--steps N] \
-         [--repeat N] [--spin-us N] [--wasm PATH] [--no-verify]\n  \
+         [--repeat N] [--halo K] [--spin-us N] [--wasm PATH] [--no-verify]\n  \
          barye-wave2d convergence"
     );
     std::process::exit(2)
@@ -116,6 +121,12 @@ impl PatchSolver for AnyPatch {
             AnyPatch::Wasm(s) => s.field(),
         }
     }
+    fn halo_width(&self) -> usize {
+        match self {
+            AnyPatch::Native(s) => s.halo_width(),
+            AnyPatch::Wasm(s) => s.halo_width(),
+        }
+    }
 }
 
 impl Solver {
@@ -141,16 +152,21 @@ impl Solver {
         }
     }
 
-    fn make(&self, p: &Wave2dProblem, b: &Block<2>) -> Result<AnyPatch, PatchError> {
+    fn make(&self, p: &Wave2dProblem, b: &Block<2>, halo: usize) -> Result<AnyPatch, PatchError> {
         Ok(match self {
-            Solver::Native => AnyPatch::Native(Wave2dPatch::new(p, b)?),
+            Solver::Native => AnyPatch::Native(Wave2dPatch::with_halo(p, b, halo)?),
+            Solver::Wasm(..) if halo != 1 => {
+                return Err(PatchError(format!(
+                    "halo width {halo}: Dyne's WebAssembly wave solver exchanges one layer every step (halo 1 only)"
+                )))
+            }
             Solver::Wasm(e, m) => AnyPatch::Wasm(Box::new(Wasm2dPatch::new_wave(e, m, p, b)?)),
         })
     }
 
     fn single(&self, p: &Wave2dProblem, steps: u64) -> Result<Vec<f64>, PatchError> {
         let d = Decomposition::whole(p.points, MIN_POINTS).map_err(|e| PatchError(e.0))?;
-        run_single(&mut self.make(p, &d.blocks[0])?, steps)
+        run_single(&mut self.make(p, &d.blocks[0], 1)?, steps)
     }
 }
 
@@ -174,6 +190,7 @@ fn check(a: &HashMap<String, String>) -> Result<bool, PatchError> {
         _ => usage(),
     };
     let splits: Vec<[usize; 2]> = a.get("splits").map_or("1x1,2x2,4x4,8x8,3x5", |s| s).split(',').map(pair).collect();
+    let halos = halo_list(a);
     let solver = Solver::from_args(a);
     let p = problem(points, initial, outer);
     println!(
@@ -186,21 +203,28 @@ fn check(a: &HashMap<String, String>) -> Result<bool, PatchError> {
     let reference = solver.single(&p, steps)?;
     println!("single patch      crc32 {:08x}", field_crc32(&reference));
     let mut ok = true;
-    for parts in splits {
-        let d = Decomposition::new(points, parts, MIN_POINTS).map_err(|e| PatchError(e.0))?;
-        let r = run_threaded(&d, steps, |b| solver.make(&p, b))?;
-        let pass = same_bits(&reference, &r.field);
-        ok &= pass;
-        println!(
-            "split {:>2}x{:<2} ({:>2} threads) crc32 {:08x}  {}",
-            parts[0],
-            parts[1],
-            d.blocks.len(),
-            field_crc32(&r.field),
-            if pass { "PASS (bit-exact)" } else { "FAIL" }
-        );
+    for &halo in &halos {
+        for &parts in &splits {
+            let d = Decomposition::new(points, parts, MIN_POINTS).map_err(|e| PatchError(e.0))?;
+            let r = run_threaded(&d, steps, |b| solver.make(&p, b, halo))?;
+            let pass = same_bits(&reference, &r.field);
+            ok &= pass;
+            println!(
+                "split {:>2}x{:<2} ({:>2} threads) halo {halo} crc32 {:08x}  {}",
+                parts[0],
+                parts[1],
+                d.blocks.len(),
+                field_crc32(&r.field),
+                if pass { "PASS (bit-exact)" } else { "FAIL" }
+            );
+        }
     }
     Ok(ok)
+}
+
+/// The `--halo` list (default 1).
+fn halo_list(a: &HashMap<String, String>) -> Vec<usize> {
+    a.get("halo").map_or("1", |s| s).split(',').map(|t| t.parse().unwrap_or_else(|_| usage())).collect()
 }
 
 /// `p` patches as `px × py` with `py` the largest divisor of `p` not above √p (px ≥ py).
@@ -235,6 +259,7 @@ fn scaling(a: &HashMap<String, String>) -> Result<bool, PatchError> {
     let verify = !a.contains_key("no-verify");
     let spin_us: u64 = a.get("spin-us").map_or(Ok(0), |s| s.parse()).unwrap_or_else(|_| usage());
     let options = RunOptions { spin: Duration::from_micros(spin_us) };
+    let halo: usize = a.get("halo").map_or(Ok(1), |s| s.parse()).unwrap_or_else(|_| usage());
     let solver = Solver::from_args(a);
     let grid = pair(a.get("grid").map_or("2048x2048", |s| s));
     let patch = pair(a.get("patch").map_or("512x512", |s| s));
@@ -243,14 +268,14 @@ fn scaling(a: &HashMap<String, String>) -> Result<bool, PatchError> {
 
     if strong {
         println!(
-            "strong scaling: grid {}x{}, {steps} steps, median of {repeat}, {} solver, spin {spin_us} us, {logical} logical CPUs",
+            "strong scaling: grid {}x{}, {steps} steps, median of {repeat}, {} solver, halo {halo}, spin {spin_us} us, {logical} logical CPUs",
             grid[0],
             grid[1],
             solver.name()
         );
     } else {
         println!(
-            "weak scaling: {}x{} points per patch, {steps} steps, median of {repeat}, {} solver, spin {spin_us} us, {logical} logical CPUs",
+            "weak scaling: {}x{} points per patch, {steps} steps, median of {repeat}, {} solver, halo {halo}, spin {spin_us} us, {logical} logical CPUs",
             patch[0],
             patch[1],
             solver.name()
@@ -275,7 +300,7 @@ fn scaling(a: &HashMap<String, String>) -> Result<bool, PatchError> {
         let d = Decomposition::new(points, parts, MIN_POINTS).map_err(|e| PatchError(e.0))?;
         let mut runs = Vec::with_capacity(repeat);
         for _ in 0..repeat {
-            let r = run_threaded_with(&d, steps, options, |b| solver.make(&p, b))?;
+            let r = run_threaded_with(&d, steps, options, |b| solver.make(&p, b, halo))?;
             runs.push((r.wall.as_secs_f64() / steps as f64, r));
         }
         runs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
@@ -324,7 +349,7 @@ fn scaling(a: &HashMap<String, String>) -> Result<bool, PatchError> {
     for _ in 0..repeat {
         let t = std::thread::scope(|sc| {
             sc.spawn(|| -> Result<f64, PatchError> {
-                let mut s = solver.make(&p, &d.blocks[0])?;
+                let mut s = solver.make(&p, &d.blocks[0], 1)?;
                 let t0 = Instant::now();
                 for _ in 0..steps {
                     s.step()?;

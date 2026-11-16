@@ -20,7 +20,14 @@
 //! not check this, so that sweeps across the limit stay possible ([`Wave2dProblem::courant`]).
 //!
 //! Only the current level `u^n` of a neighbour is used, so a patch needs one layer of ghost points and
-//! exchanges one row of values per face and step.
+//! exchanges one row of values per face and step ([`Wave2dPatch::new`], as Dyne's solver does).
+//!
+//! # Wider borders
+//!
+//! [`Wave2dPatch::with_halo`] keeps `k` layers of the neighbours' values and exchanges them once every
+//! `k` steps (with the face and the diagonal neighbours), advancing the overlap redundantly; see
+//! [`crate::halo`]. Every point still performs the same operations, so the bits do not change. Dyne's
+//! WebAssembly solver supports only `k = 1`, so all patches of a run with `k > 1` must be native.
 //!
 //! # Outer boundaries (per face)
 //!
@@ -41,8 +48,8 @@
 //! operations as this solver for the x and y terms.
 
 use crate::decomp::Block;
+use crate::halo::Window;
 use crate::patch::{PatchError, PatchSolver};
-use dyne_wire as wire;
 use dyne_wire::abi::field2d::{BC_DIRICHLET, BC_INTERFACE, BC_ZERO_GRAD};
 use dyne_wire::abi::wave2d as keys;
 
@@ -157,36 +164,29 @@ impl Wave2dProblem {
     }
 }
 
-/// What one face of a patch is.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Face {
-    Interface(u32),
-    Fixed(f64),
-    ZeroGradient,
-    Absorbing,
-}
-
 /// The native 2D wave solver for one patch.
 pub struct Wave2dPatch {
-    nx: usize,
-    ny: usize,
     nu2: f64,
     half_nu2: f64,
     kmur: f64,
-    face: [Face; 4],
-    /// Current level `u^n` with one ring of ghost points, row length `nx + 2`.
+    /// Layout, faces, neighbours and exchange schedule.
+    win: Window<2>,
+    /// Current level `u^n` with the overlap layers and one ring of ghost points.
     u: Vec<f64>,
     /// Previous level `u^{n−1}` (overwritten point by point with `u^{n+1}` during a step).
     p: Vec<f64>,
-    got: [bool; 4],
-    step: u64,
-    /// Scratch space for the values of one face as little-endian bytes.
-    edge: Vec<u8>,
 }
 
 impl Wave2dPatch {
-    /// Sets up the solver of block `b` of `problem` at step 0.
+    /// Sets up the solver of block `b` of `problem` at step 0, exchanging one layer every step.
     pub fn new(problem: &Wave2dProblem, b: &Block<2>) -> Result<Self, PatchError> {
+        Self::with_halo(problem, b, 1)
+    }
+
+    /// Sets up the solver of block `b` of `problem` at step 0, exchanging `halo` layers once every
+    /// `halo` steps. Fails if the block has fewer than `halo` points along an axis on which it has a
+    /// neighbour.
+    pub fn with_halo(problem: &Wave2dProblem, b: &Block<2>, halo: usize) -> Result<Self, PatchError> {
         let [nx, ny] = b.size;
         if nx < MIN_POINTS || ny < MIN_POINTS {
             return Err(PatchError(format!("patch of {nx}×{ny} points; at least {MIN_POINTS} per axis needed")));
@@ -201,116 +201,54 @@ impl Wave2dPatch {
         }
         let nu = problem.c * problem.dt / problem.h;
         let nu2 = nu * nu;
-        let mut face = [Face::ZeroGradient; 4];
-        for (f, slot) in face.iter_mut().enumerate() {
-            *slot = match (b.faces[f], problem.outer[f]) {
-                (Some(i), _) => Face::Interface(i.id),
-                (None, Outer::Fixed(v)) => Face::Fixed(v),
-                (None, Outer::ZeroGradient) => Face::ZeroGradient,
-                (None, Outer::Absorbing) => Face::Absorbing,
-            };
-        }
-        let w = nx + 2;
+        let win = Window::new(b, &problem.outer, halo)?;
+        let total = win.total();
         let mut s = Wave2dPatch {
-            nx,
-            ny,
             nu2,
             half_nu2: 0.5 * nu2,
             kmur: (nu - 1.0) / (nu + 1.0),
-            face,
-            u: vec![0.0; w * (ny + 2)],
-            p: vec![0.0; w * (ny + 2)],
-            got: [false; 4],
-            step: 0,
-            edge: Vec::with_capacity(8 * nx.max(ny)),
+            win,
+            u: vec![0.0; total],
+            p: vec![0.0; total],
         };
         let [ix0, iy0] = b.origin;
         for j in 0..ny {
             for i in 0..nx {
-                let k = s.at(i as isize, j as isize);
+                let k = s.win.at([i as isize, j as isize]);
                 s.u[k] = problem.initial_at(ix0 + i, iy0 + j);
             }
         }
-        s.apply_fixed();
+        let own = s.win.own();
+        s.win.apply_fixed(&mut s.u, &own);
         Ok(s)
     }
 
     /// Number of steps done.
     pub fn steps_done(&self) -> u64 {
-        self.step
+        self.win.step
     }
 
-    #[inline]
-    fn at(&self, i: isize, j: isize) -> usize {
-        ((j + 1) as usize) * (self.nx + 2) + (i + 1) as usize
+    /// Number of layers exchanged (one exchange every that many steps).
+    pub fn halo(&self) -> usize {
+        self.win.k
     }
 
-    fn face_len(&self, f: usize) -> usize {
-        if f < 2 {
-            self.ny
-        } else {
-            self.nx
-        }
-    }
-
-    /// Point `k` along face `f`, at `depth` points inward from the edge (−1 = ghost, 0 = edge,
-    /// 1 = first interior point).
-    fn face_point(&self, f: usize, k: usize, depth: isize) -> usize {
-        let (nx, ny, k) = (self.nx as isize, self.ny as isize, k as isize);
-        match f {
-            0 => self.at(depth, k),
-            1 => self.at(nx - 1 - depth, k),
-            2 => self.at(k, depth),
-            _ => self.at(k, ny - 1 - depth),
-        }
-    }
-
-    fn apply_fixed(&mut self) {
-        for f in 0..4 {
-            if let Face::Fixed(v) = self.face[f] {
-                for k in 0..self.face_len(f) {
-                    let idx = self.face_point(f, k, 0);
-                    self.u[idx] = v;
-                }
-            }
-        }
-    }
-
-    /// Fills the ghost points of the outer faces from the current level (the ghost points of the
-    /// interfaces were filled by [`PatchSolver::inbox`]).
-    fn fill_outer_ghosts(&mut self) {
-        for f in 0..4 {
-            match self.face[f] {
-                Face::Interface(_) => {}
-                Face::ZeroGradient | Face::Absorbing => {
-                    for k in 0..self.face_len(f) {
-                        let (g, m) = (self.face_point(f, k, -1), self.face_point(f, k, 1));
-                        self.u[g] = self.u[m];
-                    }
-                }
-                Face::Fixed(v) => {
-                    for k in 0..self.face_len(f) {
-                        let g = self.face_point(f, k, -1);
-                        self.u[g] = v;
-                    }
-                }
-            }
-        }
-    }
-
-    /// Interior update of all points (rows are independent; each point uses the same operations
+    /// Update of the points of `region` (rows are independent; each point uses the same operations
     /// in the same order as Dyne's solver).
-    fn update_interior(&mut self) {
-        let (nx, ny, w) = (self.nx, self.ny, self.nx + 2);
+    fn update(&mut self, region: &crate::halo::Range<2>) {
+        let [(x0, x1), (y0, y1)] = *region;
+        let nx = (x1 - x0) as usize;
+        let w = self.win.stride(1);
         let (nu2, half_nu2) = (self.nu2, self.half_nu2);
-        let first = self.step == 0;
-        for j in 1..=ny {
-            let south = &self.u[(j - 1) * w + 1..(j - 1) * w + 1 + nx];
-            let north = &self.u[(j + 1) * w + 1..(j + 1) * w + 1 + nx];
-            let west = &self.u[j * w..j * w + nx];
-            let mid = &self.u[j * w + 1..j * w + 1 + nx];
-            let east = &self.u[j * w + 2..j * w + 2 + nx];
-            let out = &mut self.p[j * w + 1..j * w + 1 + nx];
+        let first = self.win.step == 0;
+        for j in y0..y1 {
+            let r = self.win.at([x0, j]);
+            let south = &self.u[r - w..r - w + nx];
+            let north = &self.u[r + w..r + w + nx];
+            let west = &self.u[r - 1..r - 1 + nx];
+            let mid = &self.u[r..r + nx];
+            let east = &self.u[r + 1..r + 1 + nx];
+            let out = &mut self.p[r..r + nx];
             if first {
                 for i in 0..nx {
                     let u = mid[i];
@@ -326,100 +264,34 @@ impl Wave2dPatch {
             }
         }
     }
-
-    /// Mur's absorbing condition on the edge points of absorbing faces (new level in `p`).
-    fn apply_absorbing(&mut self) {
-        for f in 0..4 {
-            if self.face[f] != Face::Absorbing {
-                continue;
-            }
-            for k in 0..self.face_len(f) {
-                let (e, m) = (self.face_point(f, k, 0), self.face_point(f, k, 1));
-                self.p[e] = self.u[m] + self.kmur * (self.p[m] - self.u[e]);
-            }
-        }
-    }
 }
 
 impl PatchSolver for Wave2dPatch {
     fn outbox(&mut self, out: &mut Vec<u8>) -> Result<(), PatchError> {
-        for f in 0..4 {
-            let Face::Interface(id) = self.face[f] else { continue };
-            let n = self.face_len(f);
-            self.edge.clear();
-            for k in 0..n {
-                let v = self.u[self.face_point(f, k, 0)];
-                self.edge.extend_from_slice(&v.to_bits().to_le_bytes());
-            }
-            let hdr = wire::Header {
-                kind: wire::KIND_IFACE_BAND,
-                quantity: wire::QTY_DISPLACEMENT,
-                src: id,
-                step: self.step,
-                t_us: 0,
-            };
-            let payload = wire::Payload::IfaceBand { data: &self.edge, count: n as u32, per_point: 1 };
-            let start = out.len();
-            out.resize(start + 4 + wire::HDR_LEN + 8 + 8 * n, 0);
-            let mut mb = wire::MailboxWriter::new(&mut out[start..]);
-            mb.push(&hdr, &payload).map_err(|e| PatchError(format!("cannot encode border message: {e:?}")))?;
-            let used = mb.used();
-            out.truncate(start + used);
-        }
-        Ok(())
+        self.win.outbox(&self.u, &self.p, out)
     }
 
     fn inbox(&mut self, framed: &[u8]) -> Result<(), PatchError> {
-        for msg in wire::MailboxReader::new(framed) {
-            let (hdr, payload, _) = msg.map_err(|e| PatchError(format!("malformed border message: {e:?}")))?;
-            let wire::Payload::IfaceBand { data, count, per_point } = payload else {
-                return Err(PatchError(format!("unexpected message kind {}", hdr.kind)));
-            };
-            let f = (0..4)
-                .find(|&f| self.face[f] == Face::Interface(hdr.src))
-                .ok_or_else(|| PatchError(format!("message from unknown interface {}", hdr.src)))?;
-            if hdr.step != self.step || count as usize != self.face_len(f) || per_point < 1 {
-                return Err(PatchError(format!(
-                    "border message (interface {}, step {}, {} values) does not fit (step {}, {} values)",
-                    hdr.src,
-                    hdr.step,
-                    count,
-                    self.step,
-                    self.face_len(f)
-                )));
-            }
-            let pp = per_point as usize;
-            for k in 0..count as usize {
-                let g = self.face_point(f, k, -1);
-                self.u[g] = wire::band_get(data, k * pp);
-            }
-            self.got[f] = true;
-        }
-        Ok(())
+        self.win.inbox(&mut self.u, &mut self.p, framed)
     }
 
     fn step(&mut self) -> Result<(), PatchError> {
-        for f in 0..4 {
-            if matches!(self.face[f], Face::Interface(_)) && !self.got[f] {
-                return Err(PatchError(format!("step {}: border values of face {f} missing", self.step)));
-            }
-        }
-        self.fill_outer_ghosts();
-        self.update_interior();
-        self.apply_absorbing();
+        self.win.check_ready()?;
+        let region = self.win.region();
+        self.win.fill_outer_ghosts(&mut self.u, &region);
+        self.update(&region);
+        self.win.apply_absorbing(&self.u, &mut self.p, self.kmur, &region);
         std::mem::swap(&mut self.u, &mut self.p);
-        self.apply_fixed();
-        self.step += 1;
-        self.got = [false; 4];
+        self.win.apply_fixed(&mut self.u, &region);
+        self.win.advance();
         Ok(())
     }
 
     fn field(&mut self) -> Result<Vec<f64>, PatchError> {
-        let mut out = Vec::with_capacity(self.nx * self.ny);
-        let w = self.nx + 2;
-        for j in 1..=self.ny {
-            out.extend_from_slice(&self.u[j * w + 1..j * w + 1 + self.nx]);
-        }
-        Ok(out)
+        Ok(self.win.field(&self.u))
+    }
+
+    fn halo_width(&self) -> usize {
+        self.win.k
     }
 }
