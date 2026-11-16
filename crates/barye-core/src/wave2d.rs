@@ -33,11 +33,12 @@
 //! Absorbing faces are applied in face order west, east, south, north, then fixed faces in the same
 //! order (at a corner, the later face wins), exactly as in Dyne's solver.
 //!
-//! # Towards 3D
+//! # 3D
 //!
 //! The patch interface ([`PatchSolver`]), the decomposition and the border messages do not depend on the
-//! dimension. A 3D solver is a new type next to this one (seven-point Laplacian, stability limit
-//! `ν ≤ 1/√3`, six faces whose values are sent as flat lists); nothing else needs to change.
+//! dimension. The 3D solver ([`crate::wave3d`]) is a type next to this one (seven-point Laplacian,
+//! stability limit `ν ≤ 1/√3`, six faces whose values are sent as flat lists) and uses the same
+//! operations as this solver for the x and y terms.
 
 use crate::decomp::Block;
 use crate::patch::{PatchError, PatchSolver};
