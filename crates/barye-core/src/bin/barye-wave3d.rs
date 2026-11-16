@@ -6,6 +6,7 @@
 //! barye-wave3d scaling --mode strong [--grid 256x256x256] [--cores 1,2,4,8] [--steps 20] [--repeat 3]
 //! barye-wave3d scaling --mode weak   [--patch 64x64x64]   [--cores 1,2,4,8] [--steps 20] [--repeat 3]
 //!                      [--spin-us N] [--no-verify]
+//! barye-wave3d convergence
 //! ```
 //!
 //! `check` solves one problem as a single patch and with each split, prints the CRC-32 of each
@@ -19,6 +20,10 @@
 //! the single-patch solve of the same grid (unless `--no-verify`). The problem is a standing wave
 //! (`sin(πx)·sin(πy)·sin(πz)`, fixed value 0, Courant number 0.5), chosen so that no subnormal
 //! numbers appear (they are slow on most CPUs and would distort the timing).
+//!
+//! `convergence` runs the convergence-order check of the solver against an analytic standing wave
+//! (`barye_core::convergence`): it prints the error table and the observed orders, then
+//! `PASS (order within [1.9, 2.1])` or `FAIL` (exit code 1).
 
 use barye_core::decomp::Decomposition;
 use barye_core::field_crc32;
@@ -33,7 +38,8 @@ fn usage() -> ! {
         "usage:\n  barye-wave3d check [--grid NXxNYxNZ] [--steps N] [--splits PXxPYxPZ,...] [--initial gauss|sin|cos] \
          [--outer fixed|zero-gradient|absorbing]\n  \
          barye-wave3d scaling --mode strong|weak [--grid NXxNYxNZ] [--patch NXxNYxNZ] [--cores 1,2,...] [--steps N] \
-         [--repeat N] [--spin-us N] [--no-verify]"
+         [--repeat N] [--spin-us N] [--no-verify]\n  \
+         barye-wave3d convergence"
     );
     std::process::exit(2)
 }
@@ -279,6 +285,13 @@ fn scaling(a: &HashMap<String, String>) -> Result<bool, PatchError> {
     Ok(ok)
 }
 
+/// The convergence-order check (see `barye_core::convergence`); prints its own verdict.
+fn convergence() -> Result<bool, PatchError> {
+    let s = barye_core::convergence::study_3d()?;
+    print!("barye-wave3d convergence: ");
+    Ok(barye_core::convergence::print_report(&s))
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(cmd) = args.first() else { usage() };
@@ -286,12 +299,15 @@ fn main() -> ExitCode {
     let r = match cmd.as_str() {
         "check" => check(&a),
         "scaling" => scaling(&a),
+        "convergence" => convergence(),
         _ => usage(),
     };
     match r {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => {
-            println!("FAIL: a split differs from the single-patch solve");
+            if cmd != "convergence" {
+                println!("FAIL: a split differs from the single-patch solve");
+            }
             ExitCode::FAILURE
         }
         Err(e) => {

@@ -16,6 +16,9 @@
 #   4. the 3D wave equation on a small grid (25x23x21, 100 steps), split 1x1x1, 2x2x2, 3x2x1,
 #      4x4x2 and 1x3x5 (uneven) with one thread per patch: every split must print
 #      "PASS (bit-exact)", and the field hash must be the pinned one (2ca26bb5), the same on every OS
+#   5. convergence order of the 2D and 3D wave solvers against analytic standing waves (fixed
+#      Courant number 0.5, errors at t = 0.5 on refined grids): every observed order must lie in
+#      [1.9, 2.1] (band and reasons in crates/barye-core/src/convergence.rs)
 #
 # Usage (from the repository root):  bash scripts/ci-check.sh
 set -euo pipefail
@@ -70,6 +73,17 @@ if [ "$passes" -eq 5 ] && printf '%s\n' "$out" | grep -q "single patch         c
 else
   echo "wave3d split     FAIL"; fail=1
 fi
+
+echo "== [5] 2D and 3D wave: convergence order against analytic solutions =="
+for dim in 2d 3d; do
+  out=$(cargo run --release --locked --quiet --bin barye-wave$dim -- convergence) || true
+  echo "$out"
+  if printf '%s\n' "$out" | grep -q "^PASS (order within \[1.9, 2.1\])"; then
+    echo "wave$dim order    OK"
+  else
+    echo "wave$dim order    FAIL"; fail=1
+  fi
+done
 
 if [ "$fail" -ne 0 ]; then echo "CI CHECK FAILED"; exit 1; fi
 echo "ALL CHECKS PASSED"

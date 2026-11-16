@@ -18,8 +18,10 @@
 //!   WebAssembly wave solver;
 //! - [`wasm2d`]: running Dyne's 2D WebAssembly patch solvers as patches;
 //! - [`wave3d`]: a native 3D wave-equation patch solver (seven-point Laplacian) with a documented,
-//!   fixed order of floating-point operations.
+//!   fixed order of floating-point operations;
+//! - [`convergence`]: the convergence-order check of the wave solvers against analytic standing waves.
 
+pub mod convergence;
 pub mod decomp;
 pub mod patch;
 pub mod wasm2d;

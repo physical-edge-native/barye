@@ -101,6 +101,20 @@ cargo run --release --bin barye-wave3d -- scaling --mode strong --grid 192x192x1
 cargo run --release --bin barye-wave3d -- scaling --mode weak --patch 64x64x64 --cores 1,2,4,8
 ```
 
+## Accuracy: convergence order against analytic solutions
+
+Bit-exactness shows that splitting does not change the result, not that the result is accurate.
+Both solvers are therefore compared with analytic standing waves (`sin(πx)·sin(πy)·cos(ωt)` and its
+3D analogue, fixed value 0) at a fixed Courant number of 0.5 on refined grids. The maximum and L2
+errors at a fixed time fall as `h²`: every observed order must lie in `[1.9, 2.1]` (the reasons for
+this band are given in [`convergence.rs`](crates/barye-core/src/convergence.rs)); the measured orders
+are 2.000–2.003 in 2D and 2.001–2.004 in 3D.
+
+```sh
+cargo run --release --bin barye-wave2d -- convergence
+cargo run --release --bin barye-wave3d -- convergence
+```
+
 See [CONTRIBUTING.md](CONTRIBUTING.md) for how to propose changes.
 
 ## Open design questions
