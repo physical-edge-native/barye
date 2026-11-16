@@ -64,10 +64,8 @@ fi
 echo "== [4] 3D wave: split = single patch (bit-exact) =="
 out=$(cargo run --release --locked --quiet --bin barye-wave3d -- check --grid 25x23x21 --steps 100         --splits 1x1x1,2x2x2,3x2x1,4x4x2,1x3x5) || true
 echo "$out"
-passes=$(printf '%s
-' "$out" | grep -c "PASS (bit-exact)" || true)
-if [ "$passes" -eq 5 ] && printf '%s
-' "$out" | grep -q "single patch         crc32 2ca26bb5"; then
+passes=$(printf '%s\n' "$out" | grep -c "PASS (bit-exact)" || true)
+if [ "$passes" -eq 5 ] && printf '%s\n' "$out" | grep -q "single patch         crc32 2ca26bb5"; then
   echo "wave3d split     OK"
 else
   echo "wave3d split     FAIL"; fail=1
