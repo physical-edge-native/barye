@@ -7,8 +7,9 @@ The name (pronounced /ˈbæri/, "BAR-ee") comes from the barye, the CGS unit of 
 
 Part of the [Physical-Edge Native Architecture](https://github.com/physical-edge-native) project.
 
-> **Status: just started (2026-11).** Nothing usable yet. The design below is a draft
-> and open questions are tracked as issues.
+> **Status: first milestone (2026-11).** The 2D wave equation runs split into patches, one
+> thread per patch, and matches the single-patch solution bit for bit. The target is 3D; the
+> design below is a draft and open questions are tracked as issues.
 
 ## The question this repository answers
 
@@ -57,12 +58,39 @@ cargo test                  # unit tests
 bash scripts/ci-check.sh    # the same checks as CI (use Git Bash on Windows)
 ```
 
+`scripts/ci-check.sh` also compares the native wave solver with Dyne's WebAssembly wave solver,
+which it builds from the pinned Dyne commit; this needs `rustup target add wasm32-unknown-unknown`
+(the check is skipped with a message otherwise).
+
+## First milestone: the 2D wave equation split into patches
+
+The wave equation `u_tt = c² (u_xx + u_yy)` is solved with the leapfrog scheme (second order in
+space and time, stable for Courant numbers `c Δt / h ≤ 1/√2`). The grid is split into blocks;
+each block is advanced by its own solver on its own thread, and blocks exchange only the values
+on their borders each step, using Dyne's message format. The solver performs the same
+floating-point operations as Dyne's WebAssembly wave solver, so both give identical bits (why a
+native solver: [docs/design/2026-11-16-native-patch-solver.md](docs/design/2026-11-16-native-patch-solver.md)).
+
+```sh
+# split 1x1 ... 8x8 and 3x5 must equal the single-patch solve bit for bit
+cargo run --release --bin barye-wave2d -- check --grid 41x41 --steps 400 --splits 1x1,2x2,4x4,8x8,3x5
+# strong scaling (fixed grid) and weak scaling (fixed points per patch) over 1..N cores
+cargo run --release --bin barye-wave2d -- scaling --mode strong --grid 2048x2048 --cores 1,2,4,8
+cargo run --release --bin barye-wave2d -- scaling --mode weak --patch 256x256 --cores 1,2,4,8
+```
+
+The decomposition, the face numbering and the border messages are written for any number of
+dimensions, so that a 3D solver only adds a new patch solver.
+
 See [CONTRIBUTING.md](CONTRIBUTING.md) for how to propose changes.
 
 ## Open design questions
 
-- Parallel runtime (Rust threads, MPI, WebAssembly on PCs)?
-- Which first problem and benchmark (e.g. 2D wave equation vs. a reference solver)?
+- Parallel runtime beyond one PC (MPI, WebAssembly on PCs)? The first milestone uses Rust
+  threads on one PC.
+- How to keep scaling when the update is limited by memory bandwidth (e.g. several steps per
+  border exchange with wider borders)?
+- The 3D wave solver and a 3D interface for WebAssembly solvers shared with Dyne.
 
 ## License
 
