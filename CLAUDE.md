@@ -101,7 +101,9 @@ Physical-Edge Native Architecture(GitHub の組織 physical-edge-native)の一�
 - crates/barye-core/ … 中核のクレート。Dyne のクレートの再エクスポートと依存を守るテストに加え、
   次元によらない区画分割(decomp.rs)、区画の計算部品の差込口と1区画1スレッドの実行器(patch.rs)、
   2次元の波動方程式のネイティブ実装(wave2d.rs。Dyne の wasm の計算部品とビット一致)、
-  Dyne の2次元の wasm の計算部品の実行(wasm2d.rs)、確認と並列化の測定の道具(bin/barye-wave2d.rs)
+  Dyne の2次元の wasm の計算部品の実行(wasm2d.rs)、3次元の波動方程式のネイティブ実装(wave3d.rs)、
+  解析解との比較による収束の次数の確認(convergence.rs)、確認・並列化の測定・収束の確認の道具
+  (bin/barye-wave2d.rs、bin/barye-wave3d.rs)
 - docs/ … 日本語の内部の作業記録(docs/YYYY-MM-DD-内容.md)
 - docs/design/ … 英語の設計記録(決定・理由・ほかの案・決めた日)
 - scripts/ci-check.sh … 機材なしの回帰確認(CI と同じもの)
