@@ -9,19 +9,22 @@
 //! - the deterministic simulator parts (random numbers, discrete-event virtual time, virtual
 //!   network, loading of WebAssembly solvers), re-exported as [`sim`].
 //!
-//! What is implemented (first milestone, 2D; the target is 3D):
+//! What is implemented:
 //!
 //! - [`decomp`]: splitting a grid of any dimension into blocks, with face and interface numbering;
 //! - [`patch`]: the patch-solver interface and the runners (single patch; one thread per patch,
 //!   exchanging only border messages with neighbouring patches);
 //! - [`wave2d`]: a native 2D wave-equation patch solver that gives the same bits as Dyne's
 //!   WebAssembly wave solver;
-//! - [`wasm2d`]: running Dyne's 2D WebAssembly patch solvers as patches.
+//! - [`wasm2d`]: running Dyne's 2D WebAssembly patch solvers as patches;
+//! - [`wave3d`]: a native 3D wave-equation patch solver (seven-point Laplacian) with a documented,
+//!   fixed order of floating-point operations.
 
 pub mod decomp;
 pub mod patch;
 pub mod wasm2d;
 pub mod wave2d;
+pub mod wave3d;
 
 /// Dyne's border-exchange format (wire format version 2) and mailbox conventions.
 pub use dyne_wire as wire;

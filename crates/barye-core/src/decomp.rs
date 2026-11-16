@@ -2,7 +2,7 @@
 //! dimensions.
 //!
 //! The types are generic over the dimension `D` so that the same decomposition, face numbering and
-//! border routing serve the 2D milestone and the 3D target. Only `D = 2` has a solver so far.
+//! border routing serve the 2D milestone and the 3D target; solvers exist for `D = 2` and `D = 3`.
 //!
 //! # Conventions (shared with Dyne's 2D solvers)
 //!
