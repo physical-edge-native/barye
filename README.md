@@ -7,9 +7,9 @@ The name (pronounced /ˈbæri/, "BAR-ee") comes from the barye, the CGS unit of 
 
 Part of the [Physical-Edge Native Architecture](https://github.com/physical-edge-native) project.
 
-> **Status: first milestone (2026-11).** The 2D wave equation runs split into patches, one
-> thread per patch, and matches the single-patch solution bit for bit. The target is 3D; the
-> design below is a draft and open questions are tracked as issues.
+> **Status: early development (2026-11).** The 2D and 3D wave equations run split into
+> patches, one thread per patch, and match the single-patch solution bit for bit. The design
+> below is a draft and open questions are tracked as issues.
 
 ## The question this repository answers
 
@@ -82,6 +82,25 @@ cargo run --release --bin barye-wave2d -- scaling --mode weak --patch 256x256 --
 The decomposition, the face numbering and the border messages are written for any number of
 dimensions, so that a 3D solver only adds a new patch solver.
 
+## The 3D wave equation split into patches
+
+`u_tt = c² (u_xx + u_yy + u_zz)` is solved with the same leapfrog scheme and a seven-point
+Laplacian (stable for Courant numbers `c Δt / h ≤ 1/√3`), with fixed-value, zero-gradient or
+absorbing outer faces. Patches exchange only the values on their six faces, each face as one
+list of values (a 2D slab) in the same message format; the seven-point stencil needs no edge or
+corner values. The order of every floating-point operation is fixed and documented in
+[`wave3d.rs`](crates/barye-core/src/wave3d.rs), so that another implementation (for example a
+future WebAssembly solver for Dyne's devices) can be checked against it bit for bit. A 3D problem
+that does not vary along z gives the 2D solver's bits in every z slice.
+
+```sh
+# even and uneven splits must equal the single-patch solve bit for bit
+cargo run --release --bin barye-wave3d -- check --grid 25x23x21 --steps 100 --splits 1x1x1,2x2x2,3x2x1,4x4x2,1x3x5
+# strong and weak scaling over 1..N cores
+cargo run --release --bin barye-wave3d -- scaling --mode strong --grid 192x192x192 --cores 1,2,4,8
+cargo run --release --bin barye-wave3d -- scaling --mode weak --patch 64x64x64 --cores 1,2,4,8
+```
+
 See [CONTRIBUTING.md](CONTRIBUTING.md) for how to propose changes.
 
 ## Open design questions
@@ -90,7 +109,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for how to propose changes.
   threads on one PC.
 - How to keep scaling when the update is limited by memory bandwidth (e.g. several steps per
   border exchange with wider borders)?
-- The 3D wave solver and a 3D interface for WebAssembly solvers shared with Dyne.
+- A 3D interface for WebAssembly solvers shared with Dyne (the native 3D solver exists).
 
 ## License
 
