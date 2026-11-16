@@ -1,5 +1,11 @@
 # Barye
 
+> **Moved into [physical-edge-native/dyne](https://github.com/physical-edge-native/dyne) (`crates/dyne-native`).**
+> This repository is no longer developed. The native patch solvers, their tests and checks now live in Dyne as
+> `crates/dyne-native` (tools `dyne-native-wave2d` and `dyne-native-wave3d`); see the design record
+> [docs/design/2026-11-16-native-backend-from-barye.md](https://github.com/physical-edge-native/dyne/blob/main/docs/design/2026-11-16-native-backend-from-barye.md)
+> for the reasons and the file map.
+
 **3D field physics on CPUs, built from many cooperating local solvers.**
 
 The name (pronounced /ˈbæri/, "BAR-ee") comes from the barye, the CGS unit of pressure (1 barye = 1 dyne/cm²) — a sibling of
