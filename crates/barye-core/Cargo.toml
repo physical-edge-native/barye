@@ -10,3 +10,5 @@ publish = false
 [dependencies]
 dyne-core = { workspace = true }
 dyne-wire = { workspace = true }
+libm = { workspace = true }
+wasmi = { workspace = true }

@@ -9,3 +9,8 @@ members = ["crates/barye-core"]
 [workspace.dependencies]
 dyne-core = { git = "https://github.com/physical-edge-native/dyne", rev = "12d92ee4ae72f72a6962d3bc84666f9f4444899d" }
 dyne-wire = { git = "https://github.com/physical-edge-native/dyne", rev = "12d92ee4ae72f72a6962d3bc84666f9f4444899d" }
+# Same versions as Dyne uses (Cargo.lock keeps them identical): libm is the pure-Rust math library
+# that Dyne's solvers use for initial conditions (identical bits on every platform); wasmi runs
+# Dyne's WebAssembly solvers.
+libm = "0.2"
+wasmi = "0.47"
