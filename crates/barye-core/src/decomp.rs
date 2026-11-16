@@ -16,6 +16,10 @@
 //!   sender id of the border messages. Interfaces normal to axis 0 are numbered first, then those
 //!   normal to axis 1, and so on; within one axis they are numbered by the position of the lower
 //!   block, axis 0 fastest. In 2D this reproduces the numbering of Dyne's `dyne-sim2d`.
+//! - Blocks that touch only along an edge or at a corner (*diagonal neighbours*, needed by solvers
+//!   that exchange more than one layer of border values) get link numbers after all interfaces:
+//!   for each block in order, for each offset towards a neighbour whose first non-zero component is
+//!   +1 (offsets ordered as base-3 numbers with digits −1, 0, +1, axis 0 fastest), the next number.
 
 use std::fmt;
 
@@ -23,6 +27,19 @@ use std::fmt;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Interface {
     /// Interface number, used as the sender id in the border messages crossing it.
+    pub id: u32,
+    /// Index of the neighbouring block in [`Decomposition::blocks`].
+    pub neighbour: usize,
+}
+
+/// A block that touches another one only along an edge or at a corner (a *diagonal neighbour*).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Diagonal<const D: usize> {
+    /// Offset of the neighbour in block coordinates: each component is −1, 0 or +1, and at least two
+    /// are non-zero.
+    pub offset: [isize; D],
+    /// Link number, used as the sender id in the border messages between the two blocks. It is
+    /// shared by both blocks and differs from every interface number.
     pub id: u32,
     /// Index of the neighbouring block in [`Decomposition::blocks`].
     pub neighbour: usize,
@@ -41,6 +58,9 @@ pub struct Block<const D: usize> {
     pub size: [usize; D],
     /// For each face (`2 * axis + side`): the interface, or `None` on the outer boundary.
     pub faces: Vec<Option<Interface>>,
+    /// The diagonal neighbours (edges and corners), ordered by offset as base-3 numbers with digits
+    /// −1, 0, +1 and axis 0 fastest. Only solvers that exchange more than one layer use them.
+    pub diagonals: Vec<Diagonal<D>>,
 }
 
 impl<const D: usize> Block<D> {
@@ -111,6 +131,24 @@ fn linear<const D: usize>(coords: &[usize; D], dims: &[usize; D]) -> usize {
     k
 }
 
+/// All offsets in `{−1, 0, +1}^D` with at least two non-zero components, ordered as base-3 numbers
+/// (digits −1, 0, +1, axis 0 fastest).
+fn diagonal_offsets<const D: usize>() -> Vec<[isize; D]> {
+    let mut out = Vec::new();
+    for code in 0..3usize.pow(D as u32) {
+        let mut o = [0isize; D];
+        let mut c = code;
+        for x in o.iter_mut() {
+            *x = (c % 3) as isize - 1;
+            c /= 3;
+        }
+        if o.iter().filter(|&&x| x != 0).count() >= 2 {
+            out.push(o);
+        }
+    }
+    out
+}
+
 /// Inverse of [`linear`].
 fn unlinear<const D: usize>(mut k: usize, dims: &[usize; D]) -> [usize; D] {
     let mut c = [0; D];
@@ -176,7 +214,40 @@ impl<const D: usize> Decomposition<D> {
                         Some(Interface { id: iface_id(a, &coords), neighbour: linear(&upper, &parts) });
                 }
             }
-            blocks.push(Block { index, coords, origin, size, faces });
+            blocks.push(Block { index, coords, origin, size, faces, diagonals: Vec::new() });
+        }
+
+        // Diagonal links, numbered after the interfaces (see the module documentation).
+        let offsets = diagonal_offsets::<D>();
+        let neighbour_of = |coords: &[usize; D], o: &[isize; D]| -> Option<usize> {
+            let mut c = [0usize; D];
+            for a in 0..D {
+                let x = coords[a] as isize + o[a];
+                if x < 0 || x >= parts[a] as isize {
+                    return None;
+                }
+                c[a] = x as usize;
+            }
+            Some(linear(&c, &parts))
+        };
+        let mut ids = std::collections::BTreeMap::new();
+        let mut next = offset as u32;
+        for b in &blocks {
+            for o in &offsets {
+                let positive = o.iter().find(|&&x| x != 0) == Some(&1);
+                if let (true, Some(nb)) = (positive, neighbour_of(&b.coords, o)) {
+                    ids.insert((b.index.min(nb), b.index.max(nb)), next);
+                    next += 1;
+                }
+            }
+        }
+        for b in blocks.iter_mut() {
+            for o in &offsets {
+                if let Some(nb) = neighbour_of(&b.coords, o) {
+                    let id = ids[&(b.index.min(nb), b.index.max(nb))];
+                    b.diagonals.push(Diagonal { offset: *o, id, neighbour: nb });
+                }
+            }
         }
         Ok(Decomposition { points, parts, blocks })
     }
@@ -268,6 +339,34 @@ mod tests {
         assert_eq!(seen.len(), 20);
         assert!(seen.keys().copied().eq(0..20));
         assert!(seen.values().all(|&c| c == 2));
+    }
+
+    /// Diagonal links pair up (same id on both blocks, opposite offsets), are numbered after the
+    /// interfaces without gaps, and an inner block of a 3×3×3 split has all 20 of them.
+    #[test]
+    fn diagonal_links_pair_up() {
+        let d = Decomposition::<3>::new([9, 9, 9], [3, 3, 3], 3).unwrap();
+        let faces = 3 * (2 * 3 * 3);
+        let mut seen = std::collections::BTreeMap::new();
+        for b in &d.blocks {
+            for g in &b.diagonals {
+                let other = &d.blocks[g.neighbour];
+                let back: [isize; 3] = std::array::from_fn(|a| -g.offset[a]);
+                assert!(other.diagonals.iter().any(|h| h.id == g.id && h.offset == back && h.neighbour == b.index));
+                for a in 0..3 {
+                    assert_eq!(other.coords[a] as isize, b.coords[a] as isize + g.offset[a]);
+                }
+                *seen.entry(g.id).or_insert(0) += 1;
+            }
+        }
+        assert_eq!(d.blocks[13].diagonals.len(), 20);
+        // 3x3x3 blocks: edge links = 3 axes x 3 layers x 4 cells x 2 diagonals = 72;
+        // corner links = 8 cells x 4 body diagonals = 32
+        assert!(seen.keys().copied().eq(faces as u32..(faces + 72 + 32) as u32));
+        assert!(seen.values().all(|&c| c == 2));
+        let d2 = Decomposition::<2>::new([9, 9], [3, 3], 3).unwrap();
+        let offsets: Vec<[isize; 2]> = d2.blocks[4].diagonals.iter().map(|g| g.offset).collect();
+        assert_eq!(offsets, vec![[-1, -1], [1, -1], [-1, 1], [1, 1]]);
     }
 
     #[test]
